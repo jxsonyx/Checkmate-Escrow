@@ -876,3 +876,53 @@ fn test_unpause_emits_event() {
         "unpaused event not emitted"
     );
 }
+
+// ── Issue #65: player cannot deposit twice for the same match ─────────────────
+
+#[test]
+fn test_player1_cannot_deposit_twice() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "double_deposit_p1"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+
+    let result = client.try_deposit(&id, &player1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyFunded)),
+        "expected AlreadyFunded when player1 deposits a second time"
+    );
+}
+
+#[test]
+fn test_player2_cannot_deposit_twice() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "double_deposit_p2"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player2);
+
+    let result = client.try_deposit(&id, &player2);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyFunded)),
+        "expected AlreadyFunded when player2 deposits a second time"
+    );
+}
