@@ -1,8 +1,6 @@
-#![cfg(test)]
-
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Events},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, IntoVal, String, Symbol, TryFromVal,
 };
@@ -379,7 +377,7 @@ fn test_admin_pause_blocks_create_match() {
         &String::from_str(&env, "paused_game"),
         &Platform::Lichess,
     );
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
 }
 
 #[test]
@@ -730,6 +728,28 @@ fn test_ttl_extended_on_cancel() {
     assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
 }
 
+#[test]
+fn test_ttl_extended_on_cancel_after_deposit() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "ttl_game5"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.cancel_match(&id, &player1);
+
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Match(id))
+    });
+    assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
+}
+
 // ── Task 1: non-admin cannot call pause / unpause ────────────────────────────
 
 #[test]
@@ -1071,6 +1091,8 @@ fn test_unpause_emits_event() {
 
 #[test]
 fn test_player1_cannot_deposit_twice() {
+#[test]
+fn test_expire_match_before_timeout_fails() {
     let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -1095,6 +1117,56 @@ fn test_player1_cannot_deposit_twice() {
 
 #[test]
 fn test_player2_cannot_deposit_twice() {
+        &String::from_str(&env, "expire_early"),
+        &Platform::Lichess,
+    );
+
+    // Only player1 deposits — match stays Pending
+    client.deposit(&id, &player1);
+
+    // Timeout has not elapsed yet — should fail
+    let result = client.try_expire_match(&id);
+    assert_eq!(result, Err(Ok(Error::MatchNotExpired)));
+}
+
+#[test]
+fn test_expire_match_refunds_depositor_after_timeout() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "expire_refund"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    let balance_before = token_client.balance(&player1);
+
+    let new_seq = env.ledger().sequence() + MATCH_TTL_LEDGERS;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    });
+    env.as_contract(&token, || {
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    });
+    env.ledger().set_sequence_number(new_seq);
+
+    client.expire_match(&id);
+
+    let m = client.get_match(&id);
+    assert_eq!(m.state, MatchState::Cancelled);
+    assert_eq!(token_client.balance(&player1), balance_before + 100);
+}
+
 // ── get_escrow_balance at each deposit stage ─────────────────────────────────
 
 #[test]
@@ -1158,11 +1230,7 @@ fn test_submit_result_returns_not_funded_when_deposits_missing() {
     // Manually force the match into Active state without going through deposit,
     // simulating a state inconsistency where state == Active but deposits are missing.
     env.as_contract(&contract_id, || {
-        let mut m: Match = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Match(id))
-            .unwrap();
+        let mut m: Match = env.storage().persistent().get(&DataKey::Match(id)).unwrap();
         m.state = MatchState::Active;
         // player1_deposited and player2_deposited remain false
         env.storage().persistent().set(&DataKey::Match(id), &m);
@@ -1176,6 +1244,43 @@ fn test_submit_result_returns_not_funded_when_deposits_missing() {
     );
 }
 
+#[test]
+fn test_expire_match_emits_expired_event() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "expire_event"),
+        &Platform::Lichess,
+    );
+
+    let new_seq = env.ledger().sequence() + MATCH_TTL_LEDGERS;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    });
+    env.ledger().set_sequence_number(new_seq);
+    client.expire_match(&id);
+
+    let events = env.events().all();
+    let expected_topics = vec![
+        &env,
+        Symbol::new(&env, "match").into_val(&env),
+        soroban_sdk::symbol_short!("expired").into_val(&env),
+    ];
+    assert!(
+        events
+            .iter()
+            .any(|(_, topics, _)| topics == expected_topics),
+        "expired event not emitted"
+    );
+}
+
 // ── game_id length validation ─────────────────────────────────────────────────
 
 #[test]
@@ -1184,7 +1289,10 @@ fn test_create_match_with_oversized_game_id_fails() {
     let client = EscrowContractClient::new(&env, &contract_id);
 
     // 65 characters — one over the MAX_GAME_ID_LEN of 64
-    let oversized_id = String::from_str(&env, "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffffffff1");
+    let oversized_id = String::from_str(
+        &env,
+        "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffffffff1",
+    );
 
     let result = client.try_create_match(
         &player1,
@@ -1236,5 +1344,86 @@ fn test_deposit_blocked_when_paused() {
         result,
         Err(Ok(Error::ContractPaused)),
         "deposit must return ContractPaused when the contract is paused"
+    );
+}
+
+#[test]
+fn test_expire_active_match_fails() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "expire_active"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+
+    let new_seq = env.ledger().sequence() + MATCH_TTL_LEDGERS;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    });
+    env.ledger().set_sequence_number(new_seq);
+
+    let result = client.try_expire_match(&id);
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+}
+
+// ── submit_result blocked when contract is paused ────────────────────────────
+
+#[test]
+fn test_submit_result_blocked_when_paused() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "paused_submit_game"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+
+    client.pause();
+
+    let result = client.try_submit_result(&id, &Winner::Player1, &oracle);
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn test_is_funded_false_after_only_player1_deposits() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "partial_funded_game"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    assert!(
+        !client.is_funded(&id),
+        "is_funded must be false after only player1 deposits"
+    );
+
+    client.deposit(&id, &player2);
+    assert!(
+        client.is_funded(&id),
+        "is_funded must be true after both players deposit"
     );
 }
