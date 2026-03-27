@@ -1647,3 +1647,51 @@ fn test_get_escrow_balance_returns_match_not_found_for_nonexistent_id() {
         "get_escrow_balance must return MatchNotFound for a non-existent match_id"
     );
 }
+
+// ── TTL extended on submit_result for all Winner variants ────────────────────
+
+#[test]
+fn test_ttl_extended_on_submit_result_player1_wins() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "ttl_p1_win"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    client.submit_result(&id, &Winner::Player1, &oracle);
+
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Match(id))
+    });
+    assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
+}
+
+#[test]
+fn test_ttl_extended_on_submit_result_draw() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "ttl_draw"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    client.submit_result(&id, &Winner::Draw, &oracle);
+
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Match(id))
+    });
+    assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
+}
