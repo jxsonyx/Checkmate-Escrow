@@ -28,10 +28,36 @@ impl OracleContract {
             panic!("Contract already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.events().publish(
-            (Symbol::new(&env, "oracle"), symbol_short!("init")),
-            admin,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "oracle"), symbol_short!("init")), admin);
+    }
+
+    /// Pause the oracle — admin only. Blocks submit_result.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((Symbol::new(&env, "oracle"), symbol_short!("paused")), ());
+        Ok(())
+    }
+
+    /// Unpause the oracle — admin only.
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((Symbol::new(&env, "oracle"), symbol_short!("unpaused")), ());
+        Ok(())
     }
 
     /// Admin submits a verified match result on-chain.
@@ -47,6 +73,15 @@ impl OracleContract {
         result: MatchResult,
         escrow: Address,
     ) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::ContractPaused);
+        }
+
         let admin: Address = env
             .storage()
             .instance()
@@ -138,6 +173,14 @@ impl OracleContract {
         Ok(env.storage().persistent().has(&DataKey::Result(match_id)))
     }
 
+    /// Return the admin address set at initialization.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)
+    }
+
     /// Rotate the admin to a new address. Requires current admin auth.
     pub fn update_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         let current_admin: Address = env
@@ -183,6 +226,7 @@ mod tests {
         let escrow_id = env.register(EscrowContract, ());
         let escrow_client = EscrowContractClient::new(&env, &escrow_id);
         escrow_client.initialize(&oracle_admin, &admin, &admin);
+        escrow_client.add_allowed_token(&token_addr);
         escrow_client.create_match(
             &player1,
             &player2,
@@ -199,7 +243,15 @@ mod tests {
         let oracle_client = OracleContractClient::new(&env, &oracle_id);
         oracle_client.initialize(&oracle_admin, &oracle_admin);
 
-        (env, oracle_id, escrow_id, oracle_admin, player1, player2, token_addr)
+        (
+            env,
+            oracle_id,
+            escrow_id,
+            oracle_admin,
+            player1,
+            player2,
+            token_addr,
+        )
     }
 
     // ── has_result (public, unauthenticated) ─────────────────────────────────
@@ -288,6 +340,9 @@ mod tests {
         let (env, contract_id, escrow_id, ..) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
 
+        // Before submission
+        assert!(!client.has_result(&0u64));
+
         client.submit_result(
             &0u64,
             &String::from_str(&env, "test_game"),
@@ -295,6 +350,7 @@ mod tests {
             &escrow_id,
         );
 
+        // After submission
         assert!(client.has_result(&0u64));
         let entry = client.get_result(&0u64);
         assert_eq!(entry.result, MatchResult::Player1Wins);
@@ -337,9 +393,19 @@ mod tests {
         let (env, contract_id, escrow_id, ..) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
 
-        client.submit_result(&0u64, &String::from_str(&env, "test_game"), &MatchResult::Draw, &escrow_id);
+        client.submit_result(
+            &0u64,
+            &String::from_str(&env, "test_game"),
+            &MatchResult::Draw,
+            &escrow_id,
+        );
         // second submit should panic
-        client.submit_result(&0u64, &String::from_str(&env, "test_game"), &MatchResult::Draw, &escrow_id);
+        client.submit_result(
+            &0u64,
+            &String::from_str(&env, "test_game"),
+            &MatchResult::Draw,
+            &escrow_id,
+        );
     }
 
     #[test]
@@ -353,6 +419,26 @@ mod tests {
 
         client.initialize(&admin, &admin);
         client.initialize(&admin, &admin);
+    }
+
+    #[test]
+    fn test_get_result_returns_not_found_for_unknown_match() {
+        let (env, contract_id, ..) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        // Calling get_result on a fresh contract with no submitted results
+        // should return Error::ResultNotFound
+        let result = client.try_get_result(&999u64);
+        assert_eq!(result, Err(Ok(Error::ResultNotFound)));
+    }
+
+    #[test]
+    fn test_get_result_non_existent_match_returns_not_found() {
+        let (env, contract_id, ..) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        let result = client.try_get_result(&999u64);
+        assert!(matches!(result, Err(Ok(Error::ResultNotFound))));
     }
 
     #[test]
@@ -540,6 +626,9 @@ mod tests {
         .into()]);
 
         let result = client.try_initialize(&admin, &deployer);
-        assert!(result.is_err(), "oracle initialize must reject a non-deployer caller");
+        assert!(
+            result.is_err(),
+            "oracle initialize must reject a non-deployer caller"
+        );
     }
 }
