@@ -167,6 +167,14 @@ impl OracleContract {
         Ok(env.storage().persistent().has(&DataKey::Result(match_id)))
     }
 
+    /// Return the admin address set at initialization.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)
+    }
+
     /// Rotate the admin to a new address. Requires current admin auth.
     pub fn update_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         let current_admin: Address = env
