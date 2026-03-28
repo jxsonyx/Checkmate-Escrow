@@ -288,6 +288,9 @@ mod tests {
         let (env, contract_id, escrow_id, ..) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
 
+        // Before submission
+        assert!(!client.has_result(&0u64));
+
         client.submit_result(
             &0u64,
             &String::from_str(&env, "test_game"),
@@ -295,6 +298,7 @@ mod tests {
             &escrow_id,
         );
 
+        // After submission
         assert!(client.has_result(&0u64));
         let entry = client.get_result(&0u64);
         assert_eq!(entry.result, MatchResult::Player1Wins);
