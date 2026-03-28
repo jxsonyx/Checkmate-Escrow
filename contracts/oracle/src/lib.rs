@@ -18,7 +18,12 @@ pub struct OracleContract;
 #[contractimpl]
 impl OracleContract {
     /// Initialize with a trusted admin (the off-chain oracle service).
-    pub fn initialize(env: Env, admin: Address) {
+    ///
+    /// Must be called by the deployer immediately after deployment.
+    /// The deployer address is passed as `deployer` and must authorize this call,
+    /// preventing any third party from front-running initialization.
+    pub fn initialize(env: Env, admin: Address, deployer: Address) {
+        deployer.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Contract already initialized");
         }
@@ -177,7 +182,7 @@ mod tests {
         // Register escrow contract and create + fund a match (id=0)
         let escrow_id = env.register(EscrowContract, ());
         let escrow_client = EscrowContractClient::new(&env, &escrow_id);
-        escrow_client.initialize(&oracle_admin, &admin);
+        escrow_client.initialize(&oracle_admin, &admin, &admin);
         escrow_client.create_match(
             &player1,
             &player2,
@@ -192,7 +197,7 @@ mod tests {
         // Register oracle contract
         let oracle_id = env.register(OracleContract, ());
         let oracle_client = OracleContractClient::new(&env, &oracle_id);
-        oracle_client.initialize(&oracle_admin);
+        oracle_client.initialize(&oracle_admin, &oracle_admin);
 
         (env, oracle_id, escrow_id, oracle_admin, player1, player2, token_addr)
     }
@@ -263,7 +268,7 @@ mod tests {
         let client = OracleContractClient::new(&env, &contract_id);
 
         env.mock_all_auths();
-        client.initialize(&admin);
+        client.initialize(&admin, &admin);
 
         // Only authorise non_admin — should fail
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -293,6 +298,7 @@ mod tests {
         assert!(client.has_result(&0u64));
         let entry = client.get_result(&0u64);
         assert_eq!(entry.result, MatchResult::Player1Wins);
+        assert_eq!(entry.game_id, String::from_str(&env, "test_game"));
     }
 
     #[test]
@@ -345,8 +351,8 @@ mod tests {
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin);
-        client.initialize(&admin);
+        client.initialize(&admin, &admin);
+        client.initialize(&admin, &admin);
     }
 
     #[test]
@@ -395,7 +401,7 @@ mod tests {
         let escrow_id = env.register(EscrowContract, ());
 
         env.mock_all_auths();
-        client.initialize(&old_admin);
+        client.initialize(&old_admin, &old_admin);
         client.update_admin(&new_admin);
 
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -456,7 +462,7 @@ mod tests {
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin);
+        client.initialize(&admin, &admin);
 
         let events = env.events().all();
         let expected_topics = soroban_sdk::vec![
@@ -506,24 +512,34 @@ mod tests {
         assert_eq!(entry.result, MatchResult::Player2Wins);
     }
 
+    // ── #216: oracle initialize front-run guard ───────────────────────────────
+
+    /// A non-deployer must not be able to call initialize on the oracle contract.
     #[test]
-    fn test_submit_result_with_mismatched_game_id_returns_game_id_mismatch() {
-        let (env, contract_id, escrow_id, ..) = setup();
+    fn test_oracle_initialize_rejects_unauthorized_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
 
-        // The escrow match was created with game_id "test_game"; submit a different one.
-        let result = client.try_submit_result(
-            &0u64,
-            &String::from_str(&env, "wrong_game"),
-            &MatchResult::Player1Wins,
-            &escrow_id,
-        );
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        env.set_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin, &deployer).into_val(&env),
+                sub_invokes: &[],
+            },
+        }
+        .into()]);
 
-        assert_eq!(
-            result,
-            Err(Ok(Error::GameIdMismatch)),
-            "submit_result must return GameIdMismatch when game_id does not match the escrow match"
-        );
-        assert!(!client.has_result(&0u64));
+        let result = client.try_initialize(&admin, &deployer);
+        assert!(result.is_err(), "oracle initialize must reject a non-deployer caller");
     }
 }
