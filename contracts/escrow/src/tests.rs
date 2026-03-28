@@ -573,6 +573,23 @@ fn test_create_match_with_zero_stake_fails() {
 }
 
 #[test]
+fn test_create_match_with_same_player_fails() {
+    let (env, contract_id, _oracle, player1, _player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let result = client.try_create_match(
+        &player1,
+        &player1,
+        &100,
+        &token,
+        &String::from_str(&env, "same_player_game"),
+        &Platform::Lichess,
+    );
+
+    assert_eq!(result, Err(Ok(Error::SamePlayer)));
+}
+
+#[test]
 fn test_player2_cancel_pending_match() {
     let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);

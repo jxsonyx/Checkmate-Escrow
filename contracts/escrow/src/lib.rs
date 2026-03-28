@@ -136,6 +136,9 @@ impl EscrowContract {
         if stake_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        if player1 == player2 {
+            return Err(Error::SamePlayer);
+        }
         if game_id.len() > MAX_GAME_ID_LEN {
             return Err(Error::InvalidGameId);
         }
