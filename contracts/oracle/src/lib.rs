@@ -5,8 +5,9 @@ mod types;
 pub use types::MatchResult;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol, TryFromVal};
 use types::{DataKey, ResultEntry};
+use escrow::types::Match;
 
 /// ~30 days at 5s/ledger.
 const MATCH_TTL_LEDGERS: u32 = 518_400;
@@ -97,8 +98,13 @@ impl OracleContract {
             Result<soroban_sdk::Val, soroban_sdk::ConversionError>,
             Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
         > = env.try_invoke_contract(&escrow, &soroban_sdk::Symbol::new(&env, "get_match"), args);
-        if call_result.is_err() {
-            return Err(Error::MatchNotFound);
+        let escrow_match: Match = match call_result {
+            Ok(Ok(val)) => Match::try_from_val(&env, &val).map_err(|_| Error::MatchNotFound)?,
+            _ => return Err(Error::MatchNotFound),
+        };
+
+        if escrow_match.game_id != game_id {
+            return Err(Error::GameIdMismatch);
         }
 
         if env.storage().persistent().has(&DataKey::Result(match_id)) {
