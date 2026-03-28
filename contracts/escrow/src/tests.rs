@@ -759,6 +759,41 @@ fn test_non_oracle_cannot_submit_result() {
 }
 
 #[test]
+fn test_non_oracle_gets_unauthorized_even_when_paused() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "game_unauth_oracle_paused"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+
+    // Pause the contract (admin is mocked via setup())
+    client.pause();
+
+    let impostor = Address::generate(&env);
+    let result = client.try_submit_result(&id, &Winner::Player1, &impostor);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "expected Unauthorized when non-oracle calls submit_result on a paused contract"
+    );
+
+    // Ensure no state change or payouts
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(client.get_match(&id).state, MatchState::Active);
+    assert_eq!(token_client.balance(&player1), 900);
+    assert_eq!(token_client.balance(&player2), 900);
+}
+
+#[test]
 fn test_submit_result_on_cancelled_match_returns_invalid_state() {
     let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
@@ -1368,6 +1403,10 @@ fn test_unpause_emits_event() {
     );
 }
 
+// ── Issue #65: player cannot deposit twice for the same match ─────────────────
+
+#[test]
+fn test_player1_cannot_deposit_twice() {
 #[test]
 fn test_duplicate_game_id_rejected() {
     let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
@@ -1449,6 +1488,22 @@ fn test_expire_match_before_timeout_fails() {
         &player2,
         &100,
         &token,
+        &String::from_str(&env, "double_deposit_p1"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+
+    let result = client.try_deposit(&id, &player1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyFunded)),
+        "expected AlreadyFunded when player1 deposits a second time"
+    );
+}
+
+#[test]
+fn test_player2_cannot_deposit_twice() {
         &String::from_str(&env, "expire_early"),
         &Platform::Lichess,
     );
@@ -1660,6 +1715,17 @@ fn test_deposit_blocked_when_paused() {
         &player2,
         &100,
         &token,
+        &String::from_str(&env, "double_deposit_p2"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player2);
+
+    let result = client.try_deposit(&id, &player2);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyFunded)),
+        "expected AlreadyFunded when player2 deposits a second time"
         &String::from_str(&env, "paused_deposit_game"),
         &Platform::Lichess,
     );
@@ -2029,4 +2095,122 @@ fn test_submit_result_overflow_stake_returns_overflow() {
         Err(Ok(Error::Overflow)),
         "submit_result must return Overflow for stake_amount near i128::MAX / 2"
     );
+}
+
+// ── #186: get_match returns Completed state for all winner variants ───────────
+
+/// After submit_result with Winner::Player1, get_match must return Completed.
+#[test]
+fn test_get_match_returns_completed_state_player1_wins() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let game_id = String::from_str(&env, "completed_p1");
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &game_id,
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    seed_oracle_result(&env, &oracle, id, &game_id, Winner::Player1, &contract_id);
+    client.submit_result(&id, &oracle);
+
+    let m = client.get_match(&id);
+    assert_eq!(
+        m.state,
+        MatchState::Completed,
+        "get_match must return Completed after Player1 wins"
+    );
+}
+
+/// After submit_result with Winner::Player2, get_match must return Completed.
+#[test]
+fn test_get_match_returns_completed_state_player2_wins() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let game_id = String::from_str(&env, "completed_p2");
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &game_id,
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    seed_oracle_result(&env, &oracle, id, &game_id, Winner::Player2, &contract_id);
+    client.submit_result(&id, &oracle);
+
+    let m = client.get_match(&id);
+    assert_eq!(
+        m.state,
+        MatchState::Completed,
+        "get_match must return Completed after Player2 wins"
+    );
+}
+
+/// After submit_result with Winner::Draw, get_match must return Completed.
+#[test]
+fn test_get_match_returns_completed_state_draw() {
+    let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let game_id = String::from_str(&env, "completed_draw");
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &game_id,
+        &Platform::Lichess,
+    );
+
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    seed_oracle_result(&env, &oracle, id, &game_id, Winner::Draw, &contract_id);
+    client.submit_result(&id, &oracle);
+
+    let m = client.get_match(&id);
+    assert_eq!(
+        m.state,
+        MatchState::Completed,
+        "get_match must return Completed after Draw"
+    );
+}
+
+// ── #191: cancel_match rejects the contract address as caller ─────────────────
+
+/// Passing env.current_contract_address() as the caller to cancel_match must
+/// return Unauthorized — the contract itself is never a valid canceller.
+#[test]
+fn test_cancel_match_rejects_contract_as_caller() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "contract_caller_cancel"),
+        &Platform::Lichess,
+    );
+
+    let result = client.try_cancel_match(&id, &contract_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "cancel_match must reject the contract address as caller"
+    );
+
+    // Match must remain Pending — no state change from the rejected call
+    assert_eq!(client.get_match(&id).state, MatchState::Pending);
 }

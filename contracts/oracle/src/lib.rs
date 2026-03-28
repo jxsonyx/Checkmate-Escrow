@@ -40,6 +40,8 @@ impl OracleContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((Symbol::new(&env, "oracle"), symbol_short!("paused")), ());
         Ok(())
     }
 
@@ -52,6 +54,8 @@ impl OracleContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((Symbol::new(&env, "oracle"), symbol_short!("unpaused")), ());
         Ok(())
     }
 
@@ -396,6 +400,26 @@ mod tests {
 
         client.initialize(&admin, &admin);
         client.initialize(&admin, &admin);
+    }
+
+    #[test]
+    fn test_get_result_returns_not_found_for_unknown_match() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        // Calling get_result on a fresh contract with no submitted results
+        // should return Error::ResultNotFound
+        let result = client.try_get_result(&999u64);
+        assert_eq!(result, Err(Ok(Error::ResultNotFound)));
+    }
+
+    #[test]
+    fn test_get_result_non_existent_match_returns_not_found() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        let result = client.try_get_result(&999u64);
+        assert!(matches!(result, Err(Ok(Error::ResultNotFound))));
     }
 
     #[test]

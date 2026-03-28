@@ -51,6 +51,48 @@ impl EscrowContract {
         );
     }
 
+    /// Add a token to the allowlist — admin only.
+    pub fn add_allowed_token(env: Env, token: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) {
+            return Err(Error::TokenAlreadyAllowed);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token), &true);
+        Ok(())
+    }
+
+    /// Remove a token from the allowlist — admin only.
+    pub fn remove_allowed_token(env: Env, token: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedToken(token));
+        Ok(())
+    }
+
+    /// Check if a token is allowed.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token))
+            .unwrap_or(false)
+    }
+
     /// Pause the contract — admin only. Blocks create_match, deposit, and submit_result.
     pub fn pause(env: Env) -> Result<(), Error> {
         let admin: Address = env
@@ -142,6 +184,9 @@ impl EscrowContract {
         {
             return Err(Error::ContractPaused);
         }
+        if player1 == player2 {
+            return Err(Error::InvalidPlayers);
+        }
         if stake_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -171,6 +216,16 @@ impl EscrowContract {
             if probe.is_err() {
                 return Err(Error::InvalidToken);
             }
+        }
+
+        // Validate token is in allowlist
+        if !env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::TokenNotAllowed);
         }
 
         let id: u64 = env
@@ -211,10 +266,37 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::GameId(m.game_id.clone()), &true);
 
+        // Update player matches index
+        for player in [m.player1.clone(), m.player2.clone()] {
+            let mut matches: soroban_sdk::Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PlayerMatches(player.clone()))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            let updated_matches = matches.push_back(id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PlayerMatches(player.clone()), &updated_matches);
+            env.storage().persistent().extend_ttl(
+                &DataKey::PlayerMatches(player),
+                MATCH_TTL_LEDGERS,
+                MATCH_TTL_LEDGERS,
+            );
+        }
+
         env.events().publish(
             (Symbol::new(&env, "match"), symbol_short!("created")),
             (id, m.player1, m.player2, stake_amount),
         );
+
+        // Append to the on-chain index of active matches
+        let mut active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMatches)
+            .unwrap_or(Vec::new(&env));
+        active.push_back(id);
+        env.storage().persistent().set(&DataKey::ActiveMatches, &active);
 
         Ok(id)
     }
@@ -270,6 +352,11 @@ impl EscrowContract {
             m.player2_deposited = true;
         }
 
+        env.events().publish(
+            (Symbol::new(&env, "match"), symbol_short!("deposit")),
+            (match_id, player.clone()),
+        );
+
         if m.player1_deposited && m.player2_deposited {
             m.state = MatchState::Active;
             env.events().publish(
@@ -309,7 +396,12 @@ impl EscrowContract {
         if caller != oracle {
             return Err(Error::Unauthorized);
         }
-        caller.require_auth();
+        // require the oracle's signature before any other checks (e.g. paused)
+        oracle.require_auth();
+
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
 
         let mut m: Match = env
             .storage()
@@ -351,6 +443,24 @@ impl EscrowContract {
 
         let topics = (Symbol::new(&env, "match"), symbol_short!("completed"));
         env.events().publish(topics, (match_id, winner));
+
+        // Remove from active matches index
+        let active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMatches)
+            .unwrap_or(Vec::new(&env));
+        let mut new_active: Vec<u64> = Vec::new(&env);
+        let len = active.len();
+        let mut i = 0u32;
+        while i < len {
+            let v = active.get(i).unwrap();
+            if v != match_id {
+                new_active.push_back(v);
+            }
+            i += 1;
+        }
+        env.storage().persistent().set(&DataKey::ActiveMatches, &new_active);
 
         Ok(())
     }
@@ -401,6 +511,11 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
+        // Defensive: the contract itself must never be accepted as a valid caller.
+        if caller == env.current_contract_address() {
+            return Err(Error::Unauthorized);
+        }
+
         // Either player1 or player2 can cancel a pending match
         let is_p1 = caller == m.player1;
         let is_p2 = caller == m.player2;
@@ -434,6 +549,24 @@ impl EscrowContract {
             (Symbol::new(&env, "match"), symbol_short!("cancelled")),
             match_id,
         );
+
+        // Remove from active matches index
+        let active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMatches)
+            .unwrap_or(Vec::new(&env));
+        let mut new_active: Vec<u64> = Vec::new(&env);
+        let len = active.len();
+        let mut i = 0u32;
+        while i < len {
+            let v = active.get(i).unwrap();
+            if v != match_id {
+                new_active.push_back(v);
+            }
+            i += 1;
+        }
+        env.storage().persistent().set(&DataKey::ActiveMatches, &new_active);
 
         Ok(())
     }
@@ -549,12 +682,53 @@ impl EscrowContract {
         Ok(depositors * m.stake_amount)
     }
 
+    /// Return true if the contract has been initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().has(&DataKey::Oracle)
+    }
+
     /// Return the total number of matches created.
     pub fn get_match_count(env: Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::MatchCount)
             .unwrap_or(0)
+    }
+
+    /// Add a token address to the allowlist — admin only.
+    pub fn add_allowed_token(env: Env, token: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token), &true);
+        Ok(())
+    }
+
+    /// Remove a token address from the allowlist — admin only.
+    pub fn remove_allowed_token(env: Env, token: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedToken(token));
+        Ok(())
+    }
+
+    /// Check whether a token is on the allowlist.
+    pub fn is_allowed_token(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::AllowedToken(token))
+            .unwrap_or(false)
     }
 }
 
