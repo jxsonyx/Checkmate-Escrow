@@ -5,8 +5,9 @@ mod types;
 pub use types::MatchResult;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Symbol, TryFromVal};
 use types::{DataKey, ResultEntry};
+use escrow::types::Match;
 
 /// ~30 days at 5s/ledger.
 const MATCH_TTL_LEDGERS: u32 = 518_400;
@@ -57,8 +58,13 @@ impl OracleContract {
             Result<soroban_sdk::Val, soroban_sdk::ConversionError>,
             Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
         > = env.try_invoke_contract(&escrow, &soroban_sdk::Symbol::new(&env, "get_match"), args);
-        if call_result.is_err() {
-            return Err(Error::MatchNotFound);
+        let escrow_match: Match = match call_result {
+            Ok(Ok(val)) => Match::try_from_val(&env, &val).map_err(|_| Error::MatchNotFound)?,
+            _ => return Err(Error::MatchNotFound),
+        };
+
+        if escrow_match.game_id != game_id {
+            return Err(Error::GameIdMismatch);
         }
 
         if env.storage().persistent().has(&DataKey::Result(match_id)) {
@@ -498,5 +504,26 @@ mod tests {
 
         let entry = client.get_result(&0u64);
         assert_eq!(entry.result, MatchResult::Player2Wins);
+    }
+
+    #[test]
+    fn test_submit_result_with_mismatched_game_id_returns_game_id_mismatch() {
+        let (env, contract_id, escrow_id, ..) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        // The escrow match was created with game_id "test_game"; submit a different one.
+        let result = client.try_submit_result(
+            &0u64,
+            &String::from_str(&env, "wrong_game"),
+            &MatchResult::Player1Wins,
+            &escrow_id,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(Error::GameIdMismatch)),
+            "submit_result must return GameIdMismatch when game_id does not match the escrow match"
+        );
+        assert!(!client.has_result(&0u64));
     }
 }
