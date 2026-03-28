@@ -424,20 +424,45 @@ mod tests {
 
     #[test]
     fn test_ttl_extended_on_submit_result() {
-        let (env, contract_id, escrow_id, ..) = setup();
+        let (env, contract_id, escrow_id, _oracle_admin, player1, player2, token_addr) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
+        let escrow_client = EscrowContractClient::new(&env, &escrow_id);
 
-        client.submit_result(
-            &0u64,
-            &String::from_str(&env, "test_game"),
-            &MatchResult::Player1Wins,
-            &escrow_id,
-        );
+        let match_id_1 = 0u64;
+        let match_id_2 = escrow_client
+            .create_match(
+                &player1,
+                &player2,
+                &100,
+                &token_addr,
+                &String::from_str(&env, "test_game_b"),
+                &escrow::types::Platform::Lichess,
+            )
+            .unwrap();
+        let match_id_3 = escrow_client
+            .create_match(
+                &player1,
+                &player2,
+                &100,
+                &token_addr,
+                &String::from_str(&env, "test_game_c"),
+                &escrow::types::Platform::Lichess,
+            )
+            .unwrap();
 
-        let ttl = env.as_contract(&contract_id, || {
-            env.storage().persistent().get_ttl(&DataKey::Result(0u64))
-        });
-        assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
+        let cases = [
+            (match_id_1, MatchResult::Player1Wins, String::from_str(&env, "test_game")),
+            (match_id_2, MatchResult::Player2Wins, String::from_str(&env, "test_game_b")),
+            (match_id_3, MatchResult::Draw, String::from_str(&env, "test_game_c")),
+        ];
+
+        for (match_id, result, game_id) in cases {
+            client.submit_result(&match_id, &game_id, &result, &escrow_id);
+            let ttl = env.as_contract(&contract_id, || {
+                env.storage().persistent().get_ttl(&DataKey::Result(match_id))
+            });
+            assert_eq!(ttl, crate::MATCH_TTL_LEDGERS);
+        }
     }
 
     #[test]
